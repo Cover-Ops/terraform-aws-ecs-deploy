@@ -1,0 +1,165 @@
+# CoverOps Marketplace kit: container deploy to AWS ECS (#15). Apache 2.0.
+# Build: on your branch, build the image and push it to ECR, tagged with the commit.
+# Deploy: after a reviewer approves the GitHub environment, put that image on the
+# ECS service and wait until it is healthy. If it is not healthy in time, the
+# service goes back to the version it ran before and the job fails.
+# Rollback: call this workflow with image-tag set to an earlier tag; it skips
+# the build and deploys that image the same way, through the same approval.
+# AWS by OIDC: no access keys anywhere. Only the AWS CLI, docker and jq are used.
+name: ecs-deploy
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: AWS region, e.g. ap-south-1
+        type: string
+        required: true
+      push-role-arn:
+        description: The kit's push_role_arn output
+        type: string
+        required: true
+      deploy-role-arn:
+        description: The kit's deploy_role_arn output
+        type: string
+        required: true
+      ecr-repository-url:
+        description: The kit's repository_url output
+        type: string
+        required: true
+      ecs-cluster:
+        description: ECS cluster name (the kit's ecs_cluster_name)
+        type: string
+        required: true
+      ecs-service:
+        description: ECS service name (the kit's ecs_service_name)
+        type: string
+        required: true
+      container-name:
+        description: Name of the container in the task definition whose image is replaced
+        type: string
+        required: true
+      github-environment:
+        description: GitHub environment that gates deploys (must match the kit's github_environment)
+        type: string
+        default: production
+      image-tag:
+        description: Leave empty to build this commit. Set to an earlier tag to roll back to it.
+        type: string
+        default: ""
+      docker-context:
+        description: Folder to build
+        type: string
+        default: "."
+      dockerfile:
+        description: Dockerfile path, relative to the repository root
+        type: string
+        default: Dockerfile
+      wait-minutes:
+        description: How long the new version has to become healthy before it is rolled back
+        type: number
+        default: 15
+
+permissions: {}
+
+jobs:
+  build:
+    if: inputs.image-tag == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.push-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: Build and push the image (once per commit; tags are immutable)
+        env:
+          URL: ${{ inputs.ecr-repository-url }}
+          TAG: ${{ github.sha }}
+          CONTEXT: ${{ inputs.docker-context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images --repository-name "${URL#*/}" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "$URL:$TAG is already pushed; nothing to build."
+            exit 0
+          fi
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${URL%%/*}"
+          docker build --pull --file "$DOCKERFILE" --tag "$URL:$TAG" --label "org.opencontainers.image.revision=$TAG" "$CONTEXT"
+          docker push "$URL:$TAG"
+
+  deploy:
+    needs: build
+    # Runs after a successful build, or straight away for a rollback (build skipped).
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github-environment }}
+    concurrency:
+      group: ecs-deploy-${{ inputs.ecs-cluster }}-${{ inputs.ecs-service }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ inputs.deploy-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: Deploy, wait until healthy, roll back if not
+        env:
+          URL: ${{ inputs.ecr-repository-url }}
+          TAG: ${{ inputs.image-tag || github.sha }}
+          CLUSTER: ${{ inputs.ecs-cluster }}
+          SERVICE: ${{ inputs.ecs-service }}
+          CONTAINER: ${{ inputs.container-name }}
+          WAIT_MINUTES: ${{ inputs.wait-minutes }}
+        run: |
+          set -euo pipefail
+          IMAGE="$URL:$TAG"
+          aws ecr describe-images --repository-name "${URL#*/}" --image-ids imageTag="$TAG" >/dev/null \
+            || { echo "::error::$IMAGE is not in the repository."; exit 1; }
+
+          PREV=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
+          echo "Running now: $PREV"
+          aws ecs describe-task-definition --task-definition "$PREV" --query taskDefinition > current.json
+          jq -e --arg c "$CONTAINER" 'any(.containerDefinitions[]; .name == $c)' current.json >/dev/null \
+            || { echo "::error::No container named $CONTAINER in $PREV."; exit 1; }
+          jq --arg c "$CONTAINER" --arg i "$IMAGE" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+            | (.containerDefinitions[] | select(.name == $c) | .image) = $i' current.json > next.json
+          NEXT=$(aws ecs register-task-definition --cli-input-json file://next.json --query taskDefinition.taskDefinitionArn --output text)
+          echo "Deploying: $NEXT ($IMAGE)"
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$NEXT" >/dev/null
+
+          rollback() {
+            echo "::error::$1 Rolling back to $PREV."
+            aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$PREV" >/dev/null
+            aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE" || echo "::warning::The rollback has not settled yet: check the service."
+            {
+              echo "### Deploy failed and was rolled back"
+              echo "Tried \`$IMAGE\`; the service runs \`$PREV\` again. $1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          deadline=$(( $(date +%s) + WAIT_MINUTES * 60 ))
+          while :; do
+            STATE=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+              --query "services[0].deployments[?taskDefinition=='$NEXT'] | [0].[status, rolloutState]" --output text)
+            echo "$(date -u +%H:%M:%S) $STATE"
+            case "$STATE" in
+              "PRIMARY"*"COMPLETED") break ;;
+              *FAILED*) rollback "ECS marked the deployment failed (tasks did not start or failed health checks)." ;;
+              "None"*|"") rollback "The new version is no longer among the service's deployments." ;;
+            esac
+            [ "$(date +%s)" -lt "$deadline" ] || rollback "Not healthy after $WAIT_MINUTES minutes."
+            sleep 15
+          done
+          {
+            echo "### Deployed"
+            echo "\`$IMAGE\` runs on \`$SERVICE\` as \`$NEXT\`. Before it: \`$PREV\`."
+            echo "To roll back, run the rollback workflow with the earlier image tag."
+          } >> "$GITHUB_STEP_SUMMARY"
