@@ -4,7 +4,7 @@ A CoverOps Marketplace kit. Each push to your branch builds a container image an
 
 There are no AWS access keys anywhere: GitHub signs in to AWS through OIDC. Terraform ≥ 1.6 or OpenTofu ≥ 1.6, AWS provider 6.x. Apache 2.0.
 
-> Status: **v0.1.0, tested on 2026-11-12**: applied, re-planned with no changes and destroyed on a sandbox AWS account (ap-south-1), nothing left behind. Run `terraform plan` before you apply it to your account.
+> Status: **v0.2.0, tested on 2026-11-18**: applied, re-planned with no changes and destroyed on a sandbox AWS account (ap-south-1), nothing left behind. Run `terraform plan` before you apply it to your account.
 
 ## What it creates
 
@@ -28,7 +28,7 @@ There are no AWS access keys anywhere: GitHub signs in to AWS through OIDC. Terr
 
 ```hcl
 module "deploy" {
-  source = "github.com/Cover-Ops/terraform-aws-ecs-deploy?ref=v0.1.0"
+  source = "github.com/Cover-Ops/terraform-aws-ecs-deploy?ref=v0.2.0"
 
   project          = "acme"
   environment      = "production"
@@ -62,6 +62,14 @@ Then copy [`examples/basic/.github/workflows/deploy.yml`](examples/basic/.github
 | `image_retention_count` | Tagged images to keep | `30` |
 | `create_oidc_provider` | Create the GitHub OIDC provider; false if the account has one | `true` |
 | `extra_tags` | More tags | `{}` |
+
+## Graviton (arm64)
+
+Fargate on arm64 costs about 20% less than x86 for the same vCPU and memory. To switch:
+
+1. Make sure the image builds for arm64 (most official base images do).
+2. Set `platform: linux/arm64` in your copy of `deploy.yml`. The build then runs on GitHub's arm64 runner, with no emulation.
+3. Set `"runtimePlatform": {"cpuArchitecture": "ARM64", "operatingSystem": "LINUX"}` in the service's task definition once. Every deploy copies the current task definition, so it stays.
 
 ## Outputs
 

@@ -22,7 +22,7 @@ provider "aws" {
 
 module "deploy" {
   source = "../.."
-  # After publishing: source = "github.com/Cover-Ops/terraform-aws-ecs-deploy?ref=v0.1.0"
+  # After publishing: source = "github.com/Cover-Ops/terraform-aws-ecs-deploy?ref=v0.2.0"
 
   project          = local.project
   environment      = local.environment

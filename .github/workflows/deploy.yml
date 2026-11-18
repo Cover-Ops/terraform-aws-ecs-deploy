@@ -55,6 +55,10 @@ on:
         description: Dockerfile path, relative to the repository root
         type: string
         default: Dockerfile
+      platform:
+        description: Image platform, linux/amd64 or linux/arm64 (Graviton, about 20% cheaper on Fargate). The task definition's cpuArchitecture must match.
+        type: string
+        default: linux/amd64
       wait-minutes:
         description: How long the new version has to become healthy before it is rolled back
         type: number
@@ -65,7 +69,8 @@ permissions: {}
 jobs:
   build:
     if: inputs.image-tag == ''
-    runs-on: ubuntu-latest
+    # arm64 builds on GitHub's arm64 runner: native, no emulation.
+    runs-on: ${{ inputs.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: read
       id-token: write
@@ -81,6 +86,7 @@ jobs:
           TAG: ${{ github.sha }}
           CONTEXT: ${{ inputs.docker-context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
           if aws ecr describe-images --repository-name "${URL#*/}" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
@@ -88,7 +94,7 @@ jobs:
             exit 0
           fi
           aws ecr get-login-password | docker login --username AWS --password-stdin "${URL%%/*}"
-          docker build --pull --file "$DOCKERFILE" --tag "$URL:$TAG" --label "org.opencontainers.image.revision=$TAG" "$CONTEXT"
+          docker build --pull --platform "$PLATFORM" --file "$DOCKERFILE" --tag "$URL:$TAG" --label "org.opencontainers.image.revision=$TAG" "$CONTEXT"
           docker push "$URL:$TAG"
 
   deploy:

@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   rollback:
-    uses: Cover-Ops/terraform-aws-ecs-deploy/.github/workflows/deploy.yml@v0.1.0
+    uses: Cover-Ops/terraform-aws-ecs-deploy/.github/workflows/deploy.yml@v0.2.0
     with:
       aws-region: ap-south-1
       push-role-arn: arn:aws:iam::123456789012:role/acme-production-ecs-push
